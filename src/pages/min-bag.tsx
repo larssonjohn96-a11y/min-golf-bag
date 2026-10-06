@@ -1,0 +1,564 @@
+import { Link } from "@/components/link";
+import { AlertTriangle, ArrowLeft, CircleMinus, GitCompareArrows, Info, MapPinned, Pencil, RotateCcw, X } from "lucide-react";
+import { useState } from "react";
+import { WheelPicker } from "@/components/wheel-picker";
+import { CLUB_GROUPS, ELEVATION_VALUES, TEMPERATURE_VALUES } from "@/lib/club-groups";
+import {
+  adjustCarryForConditions,
+  analyzeGap,
+  BAG_CLUB_LIBRARY,
+  clubAgeDays,
+  clubLastUpdatedAt,
+  completeBagMap,
+  INDOOR_REFERENCE_ELEVATION_M,
+  INDOOR_REFERENCE_TEMPERATURE_C,
+  isPutterLabel,
+  latestCompletedBagMap,
+  MAX_BAG_CLUBS,
+  medianCarry,
+  acceptedShots,
+  bagHcp,
+  bagMappedCount,
+  clubConfidence,
+  clubDispersion,
+  saveCompletedBagMap,
+  type BagClub,
+  type BagMap,
+  type GapStatus,
+} from "@/lib/map-my-bag";
+
+
+const TEMPERATURES = TEMPERATURE_VALUES;
+const ELEVATIONS = ELEVATION_VALUES;
+
+const BAG_EDITOR_GROUPS = CLUB_GROUPS;
+
+type Season = "vinter" | "vår" | "sommar" | "höst";
+type FreshnessStatus = "Bra" | "Bör uppdateras" | "Gammal data";
+type WitbFieldKey = "brand" | "model" | "loft" | "shaft" | "flex" | "length" | "lie" | "grip";
+type OpenGap = {
+  clubLabel: string;
+  nextLabel: string;
+  gap: number;
+  status: GapStatus;
+  targetCarry: number | null;
+  seasonalLowConfidence: boolean;
+} | null;
+
+function seasonForDate(date: Date): Season {
+  const month = date.getMonth();
+  if (month === 11 || month <= 1) return "vinter";
+  if (month <= 4) return "vår";
+  if (month <= 7) return "sommar";
+  return "höst";
+}
+
+function seasonMismatch(updatedAt: string | null, now = new Date()) {
+  if (!updatedAt) return false;
+  const measured = new Date(updatedAt);
+  if (Number.isNaN(measured.getTime())) return false;
+  return seasonForDate(measured) !== seasonForDate(now);
+}
+
+function bagFreshness(bag: BagMap) {
+  const mapped = bag.clubs.filter((club) => !isPutterLabel(club.label) && medianCarry(club) != null);
+  const dated = mapped.flatMap((club) => {
+    const updatedAt = clubLastUpdatedAt(club);
+    const ageDays = clubAgeDays(club);
+    if (!updatedAt || ageDays == null) return [];
+    return [{ updatedAt, ageDays, seasonMismatch: seasonMismatch(updatedAt) }];
+  });
+
+  if (!dated.length) {
+    return { status: "Gammal data" as FreshnessStatus, latestMappedAt: null as string | null, needsRefresh: true };
+  }
+
+  const latestMappedAt = dated
+    .map((item) => item.updatedAt)
+    .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? null;
+  const staleCount = dated.filter((item) => item.ageDays > 90 || item.seasonMismatch).length;
+  const veryOldCount = dated.filter((item) => item.ageDays > 180).length;
+  const staleShare = staleCount / dated.length;
+  const oldestDays = Math.max(...dated.map((item) => item.ageDays));
+
+  let status: FreshnessStatus = "Bra";
+  if (veryOldCount > 0 || staleShare >= 0.5 || oldestDays > 180) status = "Gammal data";
+  else if (staleCount > 0 || oldestDays > 90) status = "Bör uppdateras";
+
+  return { status, latestMappedAt, needsRefresh: status !== "Bra" };
+}
+
+function signed(value: number) {
+  const rounded = Math.round(value);
+  return `${rounded > 0 ? "+" : ""}${rounded}`;
+}
+
+function parseIron(label: string) {
+  const match = label.trim().match(/^(\d)i$/i);
+  return match ? Number(match[1]) : null;
+}
+
+function wedgeLoft(label: string): number | null {
+  const clean = label.trim().toUpperCase();
+  const degree = clean.match(/^(\d{2})°$/);
+  if (degree) return Number(degree[1]);
+  if (clean === "PW") return 46;
+  if (clean === "AW" || clean === "GW") return 50;
+  if (clean === "SW") return 56;
+  if (clean === "LW") return 60;
+  return null;
+}
+
+function gapRecommendation(clubLabel: string, nextLabel: string, status: GapStatus, targetCarry: number | null) {
+  if (status === "tight") {
+    return "Klubborna täcker nästan samma carry. Bekräfta först längderna och överväg sedan om en av platserna i bagen kan användas bättre.";
+  }
+  const firstIron = parseIron(clubLabel);
+  const secondIron = parseIron(nextLabel);
+  if (firstIron != null && secondIron != null && Math.abs(firstIron - secondIron) === 2) {
+    const missing = (firstIron + secondIron) / 2;
+    return `Överväg ett ${missing}i för att fylla luckan runt ${Math.round(targetCarry ?? 0)} m.`;
+  }
+  const firstLoft = wedgeLoft(clubLabel);
+  const secondLoft = wedgeLoft(nextLabel);
+  if (firstLoft != null && secondLoft != null && Math.abs(firstLoft - secondLoft) >= 6) {
+    const midpoint = Math.round(((firstLoft + secondLoft) / 2) / 2) * 2;
+    return `Överväg en ${midpoint}° wedge mellan ${clubLabel} och ${nextLabel}. Sikta på ungefär ${Math.round(targetCarry ?? 0)} m carry.`;
+  }
+  return `Försök fylla luckan med en klubb runt ${Math.round(targetCarry ?? 0)} m carry, eller mappa om någon av klubborna för att bekräfta gapet.`;
+}
+
+function ConditionSelect({ label, value, unit, values, onChange }: { label: string; value: number; unit: string; values: number[]; onChange: (value: number) => void }) {
+  return <WheelPicker label={label} value={value} unit={unit} values={values} onChange={onChange} />;
+}
+
+function normalizeBagSelection(selectedLabels: string[]) {
+  const nonPutters = Array.from(new Set(selectedLabels.filter((label) => !isPutterLabel(label))));
+  return [...nonPutters.slice(0, MAX_BAG_CLUBS - 1), "Putter"];
+}
+
+function rebuildBagFromSelection(current: BagMap, selectedLabels: string[]) {
+  const now = new Date().toISOString();
+  const selected = normalizeBagSelection(selectedLabels);
+  const retainedByLabel = new Map(current.clubs.map((club) => [club.label.toLowerCase(), club]));
+  const libraryLabels = BAG_CLUB_LIBRARY as readonly string[];
+  const known = libraryLabels.filter((label) => selected.includes(label) && !isPutterLabel(label));
+  const custom = selected.filter((label) => !libraryLabels.includes(label) && !isPutterLabel(label));
+  const orderedLabels = [...known, ...custom, "Putter"].slice(0, MAX_BAG_CLUBS);
+
+  const rebuilt: BagMap = {
+    ...current,
+    id: `${Date.now()}-bag-edit`,
+    status: "draft",
+    createdAt: now,
+    updatedAt: now,
+    completedAt: undefined,
+    clubs: orderedLabels.map((label, order) => {
+      const retained = retainedByLabel.get(label.toLowerCase());
+      return retained ? { ...retained, order } : { id: `${Date.now()}-${order}-${label}`, label, order, shots: [] };
+    }),
+  };
+  return completeBagMap(rebuilt, false);
+}
+
+function goToMapping(clubLabel?: string) {
+  const params = new URLSearchParams();
+  if (clubLabel) params.set("club", clubLabel);
+  else params.set("all", "1");
+  window.location.href = `/map-club?${params.toString()}`;
+}
+
+export default function MinBagPage() {
+  const [latest, setLatest] = useState(() => latestCompletedBagMap());
+  const clubs = latest ? [...latest.clubs].reverse() : [];
+  const [adjusted, setAdjusted] = useState(false);
+  const [temperature, setTemperature] = useState(INDOOR_REFERENCE_TEMPERATURE_C);
+  const [elevation, setElevation] = useState(INDOOR_REFERENCE_ELEVATION_M);
+  const [openGap, setOpenGap] = useState<OpenGap>(null);
+  const [showBagEditor, setShowBagEditor] = useState(false);
+  const [bagSelection, setBagSelection] = useState<string[]>([]);
+  const [unmappedAfterSave, setUnmappedAfterSave] = useState<string[]>([]);
+  const [editingWitbClubId, setEditingWitbClubId] = useState<string | null>(null);
+  const [witbDraft, setWitbDraft] = useState<Partial<BagClub>>({});
+
+  const normalizedSelection = normalizeBagSelection(bagSelection);
+  const selectedNonPutterCount = normalizedSelection.filter((label) => !isPutterLabel(label)).length;
+  const displayedSelectionCount = selectedNonPutterCount + 1;
+  const freshness = latest ? bagFreshness(latest) : null;
+  const mappedCount=latest?bagMappedCount(latest):0;
+  const currentBagHcp=latest?bagHcp(latest):null;
+  const mappedClubs=latest?latest.clubs.filter(c=>!isPutterLabel(c.label)&&medianCarry(c)!=null):[];
+  const avgDispersion=(()=>{const v=mappedClubs.map(clubDispersion).filter((x):x is number=>x!=null);return v.length?v.reduce((a,b)=>a+b,0)/v.length:null})();
+  const dispersionHcp=avgDispersion==null?null:Math.max(-5,Math.min(36,Math.round((avgDispersion*2.2-5)*10)/10));
+  const carryHcp=(()=>{const driver=mappedClubs.find(c=>c.label.toLowerCase()==="driver"),v=driver?medianCarry(driver):null;return v==null?null:Math.max(-5,Math.min(36,Math.round((30-(v-180)*.22)*10)/10))})();
+  const gapProblems=latest?(()=>{const vals=latest.clubs.filter(c=>!isPutterLabel(c.label)).map(c=>({c,v:medianCarry(c)})).filter(x=>x.v!=null).sort((a,b)=>(b.v??0)-(a.v??0));let n=0;for(let i=0;i<vals.length-1;i++)if(analyzeGap(vals[i].v!,vals[i+1].v!).flagged)n++;return n})():0;
+
+  function resetConditions() {
+    setTemperature(INDOOR_REFERENCE_TEMPERATURE_C);
+    setElevation(INDOOR_REFERENCE_ELEVATION_M);
+  }
+
+  function openBagEditor() {
+    if (!latest) return;
+    setBagSelection(normalizeBagSelection(latest.clubs.map((club) => club.label)));
+    setShowBagEditor(true);
+  }
+
+  function toggleBagClub(label: string) {
+    if (isPutterLabel(label)) return;
+    setBagSelection((current) => {
+      const normalized = normalizeBagSelection(current);
+      const nonPutters = normalized.filter((item) => !isPutterLabel(item));
+      if (nonPutters.includes(label)) return normalizeBagSelection(nonPutters.filter((item) => item !== label));
+      if (nonPutters.length >= MAX_BAG_CLUBS - 1) return normalized;
+      return normalizeBagSelection([...nonPutters, label]);
+    });
+  }
+
+  function saveBagSelection() {
+    if (!latest) return;
+    const safeSelection = normalizeBagSelection(bagSelection);
+    const rebuilt = rebuildBagFromSelection(latest, safeSelection);
+    const unmapped = rebuilt.clubs.filter((club) => !isPutterLabel(club.label) && medianCarry(club) == null).map((club) => club.label);
+    setBagSelection(safeSelection);
+    setLatest(rebuilt);
+    setOpenGap(null);
+    setShowBagEditor(false);
+    setUnmappedAfterSave(unmapped);
+  }
+
+  function openWitbEditor(club: BagClub) {
+    setEditingWitbClubId(club.id);
+    setWitbDraft({
+      brand: club.brand ?? "",
+      model: club.model ?? "",
+      loft: club.loft ?? "",
+      shaft: club.shaft ?? "",
+      flex: club.flex ?? "",
+      length: club.length ?? "",
+      lie: club.lie ?? "",
+      grip: club.grip ?? "",
+    });
+  }
+
+  function saveWitbClub() {
+    if (!latest || !editingWitbClubId) return;
+    const cleaned = (value: unknown) => typeof value === "string" && value.trim() ? value.trim() : undefined;
+    const updated: BagMap = {
+      ...latest,
+      clubs: latest.clubs.map((club) =>
+        club.id === editingWitbClubId
+          ? {
+              ...club,
+              brand: cleaned(witbDraft.brand),
+              model: cleaned(witbDraft.model),
+              loft: cleaned(witbDraft.loft),
+              shaft: cleaned(witbDraft.shaft),
+              flex: cleaned(witbDraft.flex),
+              length: cleaned(witbDraft.length),
+              lie: cleaned(witbDraft.lie),
+              grip: cleaned(witbDraft.grip),
+            }
+          : club,
+      ),
+    };
+    setLatest(saveCompletedBagMap(updated));
+    setEditingWitbClubId(null);
+    setWitbDraft({});
+  }
+
+  const currentLabelsNotInPicker = latest
+    ? latest.clubs.map((club) => club.label).filter((label) => !BAG_EDITOR_GROUPS.some((group) => group.clubs.some((item) => item === label)))
+    : [];
+
+  return (
+    <main className="mx-auto min-h-screen w-full max-w-md px-5 pb-28 pt-6">
+      <header className="sticky top-0 z-40 -mx-5 border-b border-border/70 bg-background/88 px-5 pt-[max(12px,env(safe-area-inset-top))] backdrop-blur-2xl">
+        <div className="flex items-center justify-between pb-3">
+          <Link to="/" className="flex min-w-0 items-center gap-3">
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-border bg-card/80"><MapPinned className="h-5 w-5"/></span>
+            <span className="min-w-0"><span className="block text-[19px] font-black leading-none text-foreground">Min Golfbag</span><span className="mt-1 block text-xs font-semibold text-muted-foreground">{latest?latest.clubs.length:0} klubbor · Bagindex {currentBagHcp==null?"–":currentBagHcp.toFixed(1).replace(".",",")}</span></span>
+          </Link>
+          <div className="flex items-center gap-2"><span className="rounded-full border border-border bg-card/80 px-3 py-2 text-xs font-bold">{gapProblems===0?"Inga flaggade gap":"Gap "+gapProblems}</span></div>
+        </div>
+      </header>
+
+      {!latest ? (
+        <section className="mt-6 rounded-2xl border border-border bg-card p-5 text-center">
+          <MapPinned className="mx-auto h-6 w-6 text-primary" />
+          <h2 className="mt-3 text-2xl">Din golfbag börjar här</h2>
+          <p className="mt-2 text-sm text-muted-foreground">Samla dina klubbor och slaglängder digitalt. Jämför med andra golfare.</p>
+          <Link to="/map-my-bag" className="mt-5 flex w-full items-center justify-center rounded-2xl bg-primary py-4 font-semibold text-primary-foreground">Skapa min golfbag</Link>
+        </section>
+      ) : (
+        <>
+          <section className="mt-4 rounded-2xl border border-border bg-card p-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Datakvalitet</p>
+                <p className={`mt-1 text-lg font-semibold ${freshness?.status === "Bra" ? "text-primary" : freshness?.status === "Gammal data" ? "text-red-700" : "text-amber-700"}`}>{mappedCount === 0 ? "Inte mappad ännu" : freshness?.status}</p>
+              </div>
+              <div className="text-right text-xs text-muted-foreground">
+                <p>Senast mappad</p>
+                <p className="mt-1 font-semibold text-foreground">{freshness?.latestMappedAt ? new Date(freshness.latestMappedAt).toLocaleDateString("sv-SE") : "–"}</p>
+              </div>
+            </div>
+            {freshness?.needsRefresh ? (
+              <div className={`mt-3 rounded-xl p-3 ${freshness.status === "Gammal data" ? "bg-red-500/10" : "bg-amber-400/15"}`}>
+                <p className="text-xs font-semibold">{mappedCount === 0 ? "Mappa dina första slaglängder." : "Dina carry-längder behöver uppdateras."}</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">Bedömningen bygger på klubbarnas faktiska mappningsdatum, så en nyuppdaterad klubb gör inte automatiskt hela bagen färsk.</p>
+                <button type="button" onClick={() => goToMapping()} className="mt-3 rounded-full bg-foreground px-3 py-2 text-[11px] font-semibold text-background">Mappa om bagen</button>
+              </div>
+            ) : null}
+          </section>
+
+          <section className="mt-4 rounded-2xl border border-border bg-card p-3">
+            <div className="grid grid-cols-2 rounded-xl bg-muted p-1">
+              <button onClick={() => setAdjusted(false)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${!adjusted ? "bg-background shadow-sm" : "text-muted-foreground"}`}>Uppmätt</button>
+              <button onClick={() => setAdjusted(true)} className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${adjusted ? "bg-background shadow-sm" : "text-muted-foreground"}`}>Justerat</button>
+            </div>
+            {adjusted ? (
+              <div className="mt-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Spelförhållanden</p>
+                    <p className="mt-1 text-xs text-muted-foreground">Referens: {INDOOR_REFERENCE_TEMPERATURE_C}°C · havsnivå</p>
+                  </div>
+                  <button onClick={resetConditions} className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border text-muted-foreground"><RotateCcw className="h-3.5 w-3.5" /></button>
+                </div>
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  <ConditionSelect label="Temperatur" value={temperature} unit="°C" values={TEMPERATURES} onChange={setTemperature} />
+                  <ConditionSelect label="Höjd" value={elevation} unit="m" values={ELEVATIONS} onChange={setElevation} />
+                </div>
+                <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">Beräknad justering · cirka 0,1 % per °C och 2 % per 305 m. En uppskattning som inte ändrar din sparade stock-bag.</p>
+              </div>
+            ) : null}
+          </section>
+
+          <section className="mt-4 overflow-visible rounded-2xl border border-border bg-card">
+            {clubs.map((club, index) => {
+              const stock = medianCarry(club);
+              const conditions = stock != null ? adjustCarryForConditions(stock, temperature, elevation) : null;
+              const shown = adjusted && conditions ? conditions.adjustedCarry : stock;
+              const nextClub = clubs.slice(index + 1).find((candidate) => medianCarry(candidate) != null) ?? null;
+              const nextStock = nextClub ? medianCarry(nextClub) : null;
+              const nextConditions = nextStock != null ? adjustCarryForConditions(nextStock, temperature, elevation) : null;
+              const nextShown = adjusted && nextConditions ? nextConditions.adjustedCarry : nextStock;
+              const gapAnalysis = shown != null && nextShown != null ? analyzeGap(shown, nextShown) : null;
+              const currentUpdatedAt = clubLastUpdatedAt(club);
+              const nextUpdatedAt = nextClub ? clubLastUpdatedAt(nextClub) : null;
+              const gapSeasonalLowConfidence = seasonMismatch(currentUpdatedAt) || seasonMismatch(nextUpdatedAt);
+              const extremeWide = gapAnalysis?.status === "wide" && gapAnalysis.gap >= 23;
+              const isUnmapped = !isPutterLabel(club.label) && stock == null;
+
+              return (
+                <div key={club.id} className="border-b border-border px-5 py-4 last:border-b-0">
+                  <div className="flex items-center justify-between gap-4">
+                    <button type="button" onClick={() => !isPutterLabel(club.label) && goToMapping(club.label)} className="min-w-0 flex-1 text-left">
+                      <span className="text-lg font-semibold">{club.label}</span>
+                    </button>
+                    <div className="relative shrink-0 text-right">
+                      <div>
+                        {adjusted && stock != null ? <span className="mr-2 text-xs text-muted-foreground line-through">{Math.round(stock)}</span> : null}
+                        <span className="font-display text-3xl tabular-nums">{shown != null ? Math.round(shown) : "–"}</span>
+                        <span className="ml-1 text-xs text-muted-foreground">{shown != null ? "m" : ""}</span>{!isPutterLabel(club.label)&&<div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-muted-foreground"><span>{clubConfidence(club).label} · {clubConfidence(club).shots} slag</span><Info className="h-3 w-3"/></div>}{clubDispersion(club)!=null?<div className="text-[10px] text-muted-foreground">Dispersion {clubDispersion(club)!.toFixed(1).replace(".",",")} m</div>:null}
+                      </div>
+
+                      {gapAnalysis?.flagged && nextClub ? (
+                        <button
+                          type="button"
+                          aria-label={`Visa gap-varning mellan ${club.label} och ${nextClub.label}`}
+                          onClick={() => setOpenGap((current) => current?.clubLabel === club.label && current?.nextLabel === nextClub.label ? null : {
+                            clubLabel: club.label,
+                            nextLabel: nextClub.label,
+                            gap: gapAnalysis.gap,
+                            status: gapAnalysis.status,
+                            targetCarry: gapAnalysis.targetCarry,
+                            seasonalLowConfidence: gapSeasonalLowConfidence,
+                          })}
+                          className={`ml-auto mt-1 inline-flex h-6 items-center gap-1 rounded-full px-2 text-[10px] font-semibold ${gapSeasonalLowConfidence ? "opacity-65" : ""} ${gapAnalysis.status === "tight" ? "bg-sky-500/10 text-sky-700" : extremeWide ? "bg-red-500/10 text-red-700" : "bg-amber-400/15 text-amber-700"}`}
+                        >
+                          {gapAnalysis.status === "tight" ? <CircleMinus className="h-3 w-3" /> : <AlertTriangle className="h-3 w-3" />}
+                          {Math.round(gapAnalysis.gap)} m
+                        </button>
+                      ) : null}
+
+                      {openGap && nextClub && openGap.clubLabel === club.label && openGap.nextLabel === nextClub.label ? (
+                        <div className="absolute right-0 top-full z-20 mt-2 w-72 rounded-2xl border border-border bg-background p-4 text-left shadow-lg">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className={`text-xs font-semibold ${openGap.status === "tight" ? "text-sky-700" : openGap.gap >= 23 ? "text-red-700" : "text-amber-700"}`}>{openGap.status === "tight" ? "Klubborna överlappar" : openGap.gap >= 23 ? "Mycket stort gap" : "Stort gap"}</p>
+                              <p className="mt-1 text-sm font-semibold">{openGap.clubLabel} → {openGap.nextLabel} · {Math.round(openGap.gap)} m</p>
+                            </div>
+                            <button type="button" onClick={() => setOpenGap(null)} className="rounded-full p-1 text-muted-foreground"><X className="h-4 w-4" /></button>
+                          </div>
+                          {openGap.seasonalLowConfidence ? <div className="mt-2 rounded-xl bg-amber-50 p-2.5 text-[11px] leading-relaxed text-amber-800">Minst en längd är från en annan säsong. Bekräfta gärna gapet innan du ändrar bagen.</div> : null}
+                          <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">{openGap.status === "tight" ? "Skillnaden är så liten att klubborna kan fylla samma funktion." : `Riktmärket är ungefär 10–14 m. Här finns en lucka på ${Math.round(openGap.gap)} m.`}</p>
+                          <div className="mt-3 rounded-xl bg-muted/60 p-3">
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Rekommendation</p>
+                            <p className="mt-1 text-xs leading-relaxed">{gapRecommendation(openGap.clubLabel, openGap.nextLabel, openGap.status, openGap.targetCarry)}</p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  {isUnmapped ? <button type="button" onClick={() => goToMapping(club.label)} className="mt-2 rounded-full bg-primary px-3 py-1.5 text-[11px] font-semibold text-primary-foreground">Mappa klubb</button> : null}
+                  {adjusted && conditions ? <p className="mt-1 text-[10px] text-muted-foreground">Temp {signed(conditions.temperatureDelta)} m · Höjd {signed(conditions.elevationDelta)} m</p> : null}
+                </div>
+              );
+            })}
+          </section>
+
+          <a href="/jamfor?view=bag" className="group relative mt-5 flex min-h-[104px] items-center overflow-hidden rounded-[26px] border border-blue-200/70 bg-gradient-to-r from-blue-500/[.08] via-card to-red-500/[.07] px-5 py-4 shadow-sm">
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border border-blue-200 bg-blue-50 text-blue-600">
+              <GitCompareArrows className="h-6 w-6"/>
+            </span>
+            <span className="ml-4 min-w-0 flex-1">
+              <span className="block text-[10px] font-black uppercase tracking-[.16em] text-muted-foreground">Head-to-head</span>
+              <span className="mt-1 block text-xl font-black">Jämför min bag</span>
+              <span className="mt-1 block text-xs text-muted-foreground">Delade bagar · Referensnivåer</span>
+            </span>
+            <span className="ml-3 text-xl font-black text-red-500 transition-transform group-active:translate-x-0.5">→</span>
+          </a>
+
+          <section className="mt-5 overflow-hidden rounded-2xl border border-border bg-card">
+            <div className="flex items-center justify-between border-b border-border px-4 py-4">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">WITB</p>
+                <h2 className="mt-1 text-xl font-black">What's in the bag</h2>
+                <p className="mt-1 text-xs text-muted-foreground">Märke, modell och specs för varje klubb.</p>
+              </div>
+              <button type="button" onClick={openBagEditor} className="rounded-full border border-border bg-background px-3 py-2 text-xs font-semibold">Ändra bag</button>
+            </div>
+            {[...latest.clubs].reverse().map((club) => {
+              const main = [club.brand, club.model].filter(Boolean).join(" ");
+              const specs = [
+                club.loft ? `Loft ${club.loft}` : null,
+                club.shaft ? `Skaft ${club.shaft}` : null,
+                club.flex ? `Flex ${club.flex}` : null,
+                club.length ? `Längd ${club.length}` : null,
+                club.lie ? `Lie ${club.lie}` : null,
+                club.grip ? `Grepp ${club.grip}` : null,
+              ].filter(Boolean);
+              return <button key={club.id} type="button" onClick={() => openWitbEditor(club)} className="flex w-full items-center gap-3 border-b border-border px-4 py-4 text-left last:border-b-0">
+                <span className="flex h-10 w-12 shrink-0 items-center justify-center rounded-xl bg-muted text-xs font-black">{club.label}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-bold">{main || "Lägg till utrustning"}</span>
+                  <span className="mt-1 block truncate text-[11px] text-muted-foreground">{specs.length ? specs.join(" · ") : "Märke · modell · skaft · flex · längd · lie · grepp"}</span>
+                </span>
+                <Pencil className="h-4 w-4 shrink-0 text-muted-foreground" />
+              </button>;
+            })}
+          </section>
+
+          <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">Bagindex är en intern uppskattning, inte ditt officiella handicap. Temperatur- och höjdjusteringar är ungefärliga.</p><p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">Tryck på en klubb i carry-listan för att mappa om den. WITB ändrar bara utrustningsspecifikationerna.</p>
+          <Link to="/map-my-bag" className="mt-4 flex w-full items-center justify-center rounded-2xl border border-border bg-card py-4 font-semibold">Historik</Link>
+        </>
+      )}
+
+      {editingWitbClubId && latest ? (() => {
+        const club = latest.clubs.find((item) => item.id === editingWitbClubId);
+        if (!club) return null;
+        const fields: Array<{ key: WitbFieldKey; label: string; placeholder: string }> = [
+          { key: "brand", label: "Märke", placeholder: "Titleist" },
+          { key: "model", label: "Modell", placeholder: "GT3 / T150 / SM10" },
+          { key: "loft", label: "Loft", placeholder: "9° / 34°" },
+          { key: "shaft", label: "Skaft", placeholder: "Ventus Black 6X" },
+          { key: "flex", label: "Flex", placeholder: "X / S / R" },
+          { key: "length", label: "Längd", placeholder: "44,5″ / -0,5″" },
+          { key: "lie", label: "Lie", placeholder: "Standard / 1° flat" },
+          { key: "grip", label: "Grepp", placeholder: "Golf Pride MCC" },
+        ];
+        return <div className="fixed inset-0 z-[70] flex items-end justify-center bg-black/40 p-3 sm:items-center" role="dialog" aria-modal="true" aria-label={`Redigera WITB ${club.label}`}>
+          <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-3xl bg-background p-5 shadow-xl">
+            <div className="flex items-start justify-between gap-4">
+              <div><p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">WITB</p><h2 className="mt-1 text-3xl font-black">{club.label}</h2><p className="mt-1 text-xs text-muted-foreground">Utrustningsspecs påverkar inte dina carry-värden.</p></div>
+              <button type="button" onClick={() => { setEditingWitbClubId(null); setWitbDraft({}); }} className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border"><X className="h-4 w-4"/></button>
+            </div>
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              {fields.map((field) => (
+                <label key={String(field.key)} className={field.key === "model" || field.key === "shaft" || field.key === "grip" ? "col-span-2" : ""}>
+                  <span className="mb-1.5 block text-[10px] font-bold uppercase tracking-[.12em] text-muted-foreground">{field.label}</span>
+                  <input
+                    value={String(witbDraft[field.key] ?? "")}
+                    onChange={(event) => setWitbDraft((current) => ({ ...current, [field.key]: event.target.value }))}
+                    placeholder={field.placeholder}
+                    className="min-h-12 w-full rounded-xl border border-border bg-card px-3 text-sm outline-none focus:border-primary"
+                  />
+                </label>
+              ))}
+            </div>
+            <button type="button" onClick={saveWitbClub} className="mt-5 min-h-14 w-full rounded-2xl bg-primary text-sm font-bold text-primary-foreground">Spara {club.label}</button>
+          </div>
+        </div>;
+      })() : null}
+
+      {showBagEditor && latest ? (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-3 sm:items-center" role="dialog" aria-modal="true" aria-label="Ändra bag">
+          <div className="max-h-[88vh] w-full max-w-md overflow-y-auto rounded-3xl bg-background p-5 shadow-xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Bygg om din bag</p>
+                <h2 className="mt-1 text-2xl font-semibold">Välj upp till 14 klubbor</h2>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Nya klubbor kan sparas utan carry. Putter är alltid reserverad och räknas som en av 14.</p>
+              </div>
+              <button type="button" onClick={() => setShowBagEditor(false)} className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="mt-4 flex items-center justify-between rounded-xl bg-muted/60 px-3 py-2.5"><span className="text-xs font-semibold">Valda klubbor</span><span className="text-sm font-semibold tabular-nums text-primary">{displayedSelectionCount}/{MAX_BAG_CLUBS}</span></div>
+            <div className="mt-4 space-y-5">
+              {BAG_EDITOR_GROUPS.map((group) => (
+                <section key={group.title}>
+                  <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">{group.title}</p>
+                  <div className="flex flex-wrap gap-2">
+                    {group.clubs.map((label) => {
+                      const locked = isPutterLabel(label);
+                      const selected = locked || normalizedSelection.includes(label);
+                      const disabled = !selected && !locked && selectedNonPutterCount >= MAX_BAG_CLUBS - 1;
+                      return <button key={label} type="button" disabled={locked || disabled} onClick={() => toggleBagClub(label)} className={`min-h-10 rounded-full border px-3 py-2 text-xs font-semibold transition ${selected ? "border-primary bg-primary/10 text-primary" : "border-border bg-card text-foreground"} disabled:opacity-50`}>{selected ? "✓ " : ""}{label}{locked ? " · krävs" : ""}</button>;
+                    })}
+                  </div>
+                </section>
+              ))}
+              {currentLabelsNotInPicker.length ? (
+                <section>
+                  <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Övriga i din bag</p>
+                  <div className="flex flex-wrap gap-2">
+                    {currentLabelsNotInPicker.map((label) => {
+                      const selected = normalizedSelection.includes(label);
+                      const disabled = !selected && selectedNonPutterCount >= MAX_BAG_CLUBS - 1;
+                      return <button key={label} type="button" disabled={disabled} onClick={() => toggleBagClub(label)} className={`min-h-10 rounded-full border px-3 py-2 text-xs font-semibold ${selected ? "border-primary bg-primary/10 text-primary" : "border-border bg-card"} disabled:opacity-50`}>{selected ? "✓ " : ""}{label}</button>;
+                    })}
+                  </div>
+                </section>
+              ) : null}
+            </div>
+            <div className="sticky bottom-0 mt-6 bg-background pt-3">
+              <button type="button" onClick={saveBagSelection} className="flex w-full items-center justify-center rounded-2xl bg-primary py-4 text-sm font-semibold text-primary-foreground">Spara bag · {displayedSelectionCount}/{MAX_BAG_CLUBS}</button>
+              <p className="mt-2 text-center text-[11px] text-muted-foreground">Du kan alltid mappa nya klubbor efter att bagen är sparad.</p>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {unmappedAfterSave.length ? (
+        <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/40 p-3 sm:items-center" role="dialog" aria-modal="true" aria-label="Nya klubbor utan mappat avstånd">
+          <div className="w-full max-w-md rounded-3xl bg-background p-5 shadow-xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-700">Bagen är sparad</p>
+                <h2 className="mt-1 text-2xl font-semibold">Nya klubbor utan mappat avstånd</h2>
+                <p className="mt-2 text-sm leading-relaxed text-muted-foreground">Du kan mappa dem nu eller göra det senare från Min Golfbag.</p>
+              </div>
+              <button type="button" onClick={() => setUnmappedAfterSave([])} className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">{unmappedAfterSave.map((label) => <span key={label} className="rounded-full bg-muted px-3 py-1.5 text-xs font-semibold">{label}</span>)}</div>
+            <div className="mt-5 grid grid-cols-2 gap-2">
+              <button type="button" onClick={() => goToMapping()} className="rounded-2xl bg-primary py-3.5 text-sm font-semibold text-primary-foreground">Mappa direkt</button>
+              <button type="button" onClick={() => setUnmappedAfterSave([])} className="rounded-2xl border border-border bg-card py-3.5 text-sm font-semibold">Senare</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </main>
+  );
+}
